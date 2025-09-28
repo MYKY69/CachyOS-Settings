@@ -1,0 +1,1174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Simple Video Encoder - Universal format conversion script with optional two-pass encoding and size targeting
+# Self-installation:
+#   ./script.sh -i name   -> installs this script to /usr/local/bin/name
+#   name -r               -> uninstalls (removes) /usr/local/bin/name
+
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_NAME="$(basename "$0")"
+INSTALL_DIR="/usr/local/bin"
+EDITOR=kate
+
+# Default settings
+VIDEO_CODEC="libx265"
+AUDIO_MODE="encode"          # "copy" or "encode"
+AUDIO_CODEC="libopus"      # used if AUDIO_MODE=encode
+AUDIO_BITRATE="96k"       # used if AUDIO_MODE=encode or for size calc
+CONTAINER="mp4"
+BITRATE=""                 # auto or manual
+MAXRATE=""
+BUFSIZE=""
+PRESET=""
+SUFFIX="_tra"
+DELETE_ORIGINAL=0
+EXTENSIONS=("mp4" "mkv" "avi" "mov" "webm" "gif")
+FORCE_ENCODE=0               # Force re-encoding even if same codec
+OUTPUT_DIR=""
+CRF=""
+QSCALE=""
+GLOBAL_QUALITY=""
+USE_TWOPASS=0            # Enable two-pass mode
+LOG_PREFIX="ffmpeg2pass"
+TARGET_SIZE=""             # e.g. 50M, for file size targeting
+EXTRA_OPTS=""
+FPS_LIMIT=""
+START_TIME=""              # Start time (e.g. 00:01:30)
+END_TIME=""                # End time (e.g. 00:05:45)
+MINTERP=""
+TARGET_HEIGHT=""
+nice="0"
+target_ssim=""             # Target ssim score (e.g. best good mid bad, or number 0.95....., enables CRF prediction)
+SSIM_SAMPLES=4             # Number of samples for ssim calculation
+SSIM_SAMPLE_DURATION=20    # Duration of each sample in seconds
+QUALITY="1"               # small slowdown or other stuff as too long keyframes, worth it most often.
+OPUS_COMP_LEVEL=10       # 10 best, 1 fastest
+OPUS_VBR=on # constrained= least space used, on= most space used, off= predictive
+PIX=""
+
+# yuv420p      # 8-bit 4:2:0 - Universal compatibility (most common)
+# yuv420p10le  # 10-bit 4:2:0 - Better quality, HDR support
+# yuv422p      # 8-bit 4:2:2 - Professional workflows
+# yuv444p
+
+# yuv420p      # 4:2:0 subsampling (web/streaming standard)
+# yuv422p      # 4:2:2 subsampling (broadcast standard)
+# yuv444p      # 4:4:4 no subsampling (highest quality)
+# yuv410p      # 4:1:0 very aggressive subsampling (rarely used)
+# yuv411p      # 4:1:1 subsampling (old DV format)
+
+# yuv420p10le  # 10-bit 4:2:0 (HDR, better gradients)
+# yuv422p10le  # 10-bit 4:2:2 (professional HDR)
+# yuv444p10le  # 10-bit 4:4:4 (master quality)
+
+INTERRUPTED=0
+FFMPEG_PID=""
+
+# Convert human size (e.g. 50M, 1G) to bytes
+size_to_bytes() {
+  local val=${1^^}
+  if [[ $val =~ ^([0-9]+)(K|M|G)?$ ]]; then
+    local num=${BASH_REMATCH[1]}
+    case ${BASH_REMATCH[2]} in
+      K) echo $((num * 1024)) ;;
+      M) echo $((num * 1024**2)) ;;
+      G) echo $((num * 1024**3)) ;;
+      *) echo $num ;;
+    esac
+  else
+    echo "0";
+  fi
+}
+
+cleanup_and_exit() {
+    echo -e "\n🛑 Interrupt received, cleaning up..."
+    INTERRUPTED=1
+
+    # Kill ffmpeg if it's running
+    if [[ -n "$FFMPEG_PID" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
+        echo "⏹️ Stopping ffmpeg process..."
+        kill -TERM "$FFMPEG_PID" 2>/dev/null
+        sleep 2
+        # Force kill if still running
+        if kill -0 "$FFMPEG_PID" 2>/dev/null; then
+            kill -KILL "$FFMPEG_PID" 2>/dev/null
+        fi
+    fi
+
+    # Clean up any partial output files
+    if [[ -n "${CURRENT_OUTPUT_FILE:-}" && -f "$CURRENT_OUTPUT_FILE" ]]; then
+        echo "🗑️ Removing incomplete output file: $CURRENT_OUTPUT_FILE"
+        rm -f "$CURRENT_OUTPUT_FILE"
+    fi
+
+    echo "👋 Exiting..."
+    exit 130  # Standard exit code for SIGINT
+}
+
+trap cleanup_and_exit SIGINT SIGTERM
+
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] {single|folder|interpolate|vmaf|diff} <file_or_dir>
+
+Modes:
+  single             Convert one file
+  folder             Convert all files in directory (recursively)
+  interpolate        Runs Rife interpolation on single file, 2x only
+  vmaf               Calculates VMAF based on original and transcoded video
+  diff               Shows difference between original and transcoded video
+
+Options:
+  -r                 Remove originals after successful conversion
+  -f                 Force re-encoding even if file already uses target codec
+  -2                 Use two-pass encoding
+  -S size            Target total file size (e.g. 50M, overrides -b)
+  -c codec           Video codec (default: $VIDEO_CODEC)
+  -p preset          Encoder preset (default: $PRESET)
+  -b bitrate         Target video bitrate (e.g. 5M)
+  -m maxrate         Max video rate (e.g. 6M)
+  -u bufsize         Video bufsize (e.g. 10M)
+  -a mode            Audio: "copy" or "encode" (default: $AUDIO_MODE)
+  -k codec           Audio codec (if encoding; default: $AUDIO_CODEC)
+  -q abr             Audio bitrate (if encoding; default: $AUDIO_BITRATE)
+  -x ext1,ext2,...   Comma-sep list of extensions (default: ${EXTENSIONS[*]})
+  -s suffix          Suffix for output filenames (default: $SUFFIX)
+  -t container       Output container (default: $CONTAINER)
+  -o directory       Output directory (default: same as input file)
+  -C crf             CRF value (e.g. 23)
+  -Q qscale          Qscale value (e.g. 3)
+  -G quality         Set global quality (1–51) for HEVC encoder
+  -l logprefix       Prefix for two-pass log files (default: $LOG_PREFIX)
+  -R height          Set vertical resolution; adds letterboxing to preserve aspect ratio
+  -T time            Start time (e.g. 00:01:30 or 90)
+  -E time            End time (e.g. 00:05:45 or 345)
+  -F fps             Limit frame rate
+  -P pix_fmt         Pixel format (e.g. yuv420p, yuv420p10le, gray)
+  -n value           Niceness value for ffmpeg (-20 highest, 19 lowest)
+  -M mode:rate       Motion interpolation mode (e.g. film:60, anime:48)
+                     Modes: film, anime, smooth, action
+                     Rate: target fps (e.g. 60)
+  -X                 Extra options passed directly to ffmpeg
+  -h                 Show this help
+  -V ssim            Target ssim score (e.g. best good mid bad, or number 0.95....., enables CRF prediction)
+
+Management:
+  --install name       Install this script to system-wide directory as <name>
+  --installtermux name Install this script to Termux bin as <name>
+  --remove             Uninstall this script (only if run from installed path)
+  --edit               Edit this script using \$EDITOR
+  --export             Export this script to current directory
+  --listall            List all available FFmpeg encoders
+  --listcodec name     Show detailed info about specified encoder
+EOF
+  exit 1
+}
+
+# Handle install/uninstall/edit/export/list/encoder help
+if [[ "${1-}" == "--install" ]]; then
+    [[ $# -eq 2 ]] || usage
+    sudo cp "$SCRIPT_PATH" "$INSTALL_DIR/$2"
+    sudo chmod +x "$INSTALL_DIR/$2"
+    echo "Installed as $2"
+    exit
+fi
+
+if [[ "${1-}" == "--installtermux" ]]; then
+    [[ $# -eq 2 ]] || usage
+    cp "$SCRIPT_PATH" "$PREFIX/bin/$2"
+    chmod +x "$PREFIX/bin/$2"
+    echo "Installed as $2 in Termux"
+    exit
+fi
+
+if [[ "${1-}" == "--remove" && $(dirname "$SCRIPT_PATH") == "$INSTALL_DIR" ]]; then
+    sudo rm -f "$SCRIPT_PATH"
+    echo "Uninstalled"
+    exit
+fi
+
+if [[ "${1-}" == "--edit" ]]; then
+    "$EDITOR" "$SCRIPT_PATH"
+    exit
+fi
+
+if [[ "${1-}" == "--export" ]]; then
+    cp "$SCRIPT_PATH" "./$(basename "$SCRIPT_PATH")"
+    echo "Exported to $(pwd)/$(basename "$SCRIPT_PATH")"
+    exit
+fi
+
+if [[ "${1-}" == "--listall" ]]; then
+    ffmpeg -hide_banner -encoders
+    exit
+fi
+
+if [[ "${1-}" == "--listcodec" ]]; then
+    [[ $# -eq 2 ]] || { echo "Usage: $0 -L <encoder>"; exit 1; }
+    ffmpeg -h encoder="$2"
+    exit
+fi
+
+if [[ "${1-}" == "vmaf" && $# -eq 3 ]]; then
+    REF="$2"
+    DIST="$3"
+    ffmpeg -i "$REF" -i "$DIST" \
+      -filter_complex "[0:v]setpts=PTS-STARTPTS,fps=24[ref];[1:v]setpts=PTS-STARTPTS,fps=24[dist];[ref][dist]libvmaf" \
+      -f null - 2>&1 | grep "VMAF score"
+    exit
+fi
+
+if [[ "${1-}" == "diff" && $# -eq 3 ]]; then
+    REF="$2"
+    DIST="$3"
+    BASENAME="${REF##*/}"
+    OUTNAME="diff_${BASENAME%.*}.mp4"
+    ffmpeg -i "$REF" -i "$DIST" \
+      -filter_complex "[0:v]setpts=PTS-STARTPTS,fps=24[ref];[1:v]setpts=PTS-STARTPTS,fps=24[dist];[ref][dist]blend=all_mode=difference" \
+      -c:v libx265 -preset fast -crf 24 -an "$OUTNAME"
+    echo "Saved diff as $OUTNAME"
+    exit
+fi
+
+# Parse options
+while getopts ":rfc:p:b:m:u:a:k:q:s:t:o:h:C:Q:G:l:S:P:2X:X:n:R:T:E:F:M:V:" opt; do
+  case $opt in
+    r) DELETE_ORIGINAL=1 ;;
+    f) FORCE_ENCODE=1 ;;
+    2) USE_TWOPASS=1 ;;
+    S) TARGET_SIZE=$OPTARG ;;
+    c) VIDEO_CODEC=$OPTARG ;;
+    p) PRESET=$OPTARG ;;
+    b) BITRATE=$OPTARG ;;
+    m) MAXRATE=$OPTARG ;;
+    u) BUFSIZE=$OPTARG ;;
+    a) AUDIO_MODE=$OPTARG ;;
+    k) AUDIO_CODEC=$OPTARG ;;
+    q) AUDIO_BITRATE=$OPTARG ;;
+    s) SUFFIX=$OPTARG ;;
+    t) CONTAINER=$OPTARG ;;
+    o) OUTPUT_DIR=$OPTARG ;;
+    C) CRF=$OPTARG ;;
+    Q) QSCALE=$OPTARG ;;
+    G) GLOBAL_QUALITY=$OPTARG ;;
+    l) LOG_PREFIX=$OPTARG ;;
+    X) EXTRA_OPTS=$OPTARG ;;
+    R) TARGET_HEIGHT=$OPTARG ;;
+    T) START_TIME=$OPTARG ;;
+    E) END_TIME=$OPTARG ;;
+    F) FPS_LIMIT=$OPTARG ;;
+    M) MINTERP=$OPTARG ;;
+    n) nice=$OPTARG ;;
+    P) PIX=$OPTARG ;;
+    V) target_ssim=$OPTARG ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 2 ]] || usage
+MODE=$1
+TARGET=$2
+[[ -n "$OUTPUT_DIR" && ! -d "$OUTPUT_DIR" ]] && mkdir -p "$OUTPUT_DIR"
+
+# Build audio flags and return audio bitrate in bps for size calc
+audio_flags() {
+    # Normalize bitrate for comparison
+    local bitrate="${AUDIO_BITRATE,,}"     # lowercase
+    bitrate="${bitrate// /}"               # remove spaces
+
+    # Handle disabled audio
+    if [[ "${AUDIO_CODEC:-}" == "none" ]] || \
+       [[ "${DISABLE_AUDIO:-0}" -eq 1 ]] || \
+       [[ "$bitrate" == "0k" ]] || \
+       [[ "$bitrate" == "0" ]]; then
+        echo "-an"
+        return
+    fi
+
+    # Copy mode
+    if [[ "${AUDIO_MODE}" == "copy" ]]; then
+        echo "-c:a copy"
+        return
+    fi
+
+    # Re-encode with specified codec and bitrate
+    local codec_flags="-c:a ${AUDIO_CODEC:-aac} -b:a $AUDIO_BITRATE"
+
+    # Add libopus-specific options
+  if [[ "${AUDIO_CODEC}" == "libopus" ]]; then
+      [[ -n "${OPUS_VBR}" ]] && codec_flags+=" -vbr ${OPUS_VBR}"
+      [[ -n "${OPUS_COMP_LEVEL}" ]] && codec_flags+=" -compression_level ${OPUS_COMP_LEVEL}"
+      codec_flags+=" -apply_phase_inv 0 -frame_duration 60"
+  fi
+
+    echo "$codec_flags"
+}
+
+get_audio_bitrate_bps() {
+  if [[ "$AUDIO_MODE" == "encode" ]]; then
+    echo $(( $(size_to_bytes "$AUDIO_BITRATE") * 8 ))
+  else
+    ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=nw=1:nk=1 "$1"
+  fi
+}
+
+# SSIM-based CRF prediction function
+predict_crf_for_ssim() {
+    local infile="$1"
+    local target_ssim_input="$2"
+    local temp_dir="/tmp/ssim_predict_$"
+    mkdir -p "$temp_dir"
+
+    # Convert word-based targets to numeric values
+    local target_ssim
+    case "${target_ssim_input,,}" in  # Convert to lowercase
+        "best")
+            target_ssim="0.995"
+            echo "🎯 Predicting CRF for target SSIM: $target_ssim (best quality)"
+            ;;
+        "good")
+            target_ssim="0.99"
+            echo "🎯 Predicting CRF for target SSIM: $target_ssim (good quality)"
+            ;;
+        "mid"|"medium")
+            target_ssim="0.98"
+            echo "🎯 Predicting CRF for target SSIM: $target_ssim (medium quality)"
+            ;;
+        "bad"|"low")
+            target_ssim="0.98"
+            echo "🎯 Predicting CRF for target SSIM: $target_ssim (low quality)"
+            ;;
+        *)
+            # Assume it's a numeric value, validate it
+            if [[ "$target_ssim_input" =~ ^[0-9]*\.?[0-9]+$ ]] && (( $(echo "$target_ssim_input >= 0 && $target_ssim_input <= 1" | bc -l 2>/dev/null || echo 0) )); then
+                target_ssim="$target_ssim_input"
+                echo "🎯 Predicting CRF for target SSIM: $target_ssim"
+            else
+                echo "❌ Invalid SSIM target: $target_ssim_input"
+                echo "   Valid options: best (0.995), good (0.99), mid/medium (0.98), bad/low (0.97), or numeric value 0.0-1.0"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            ;;
+    esac
+
+    # Get video duration - handle decimal values properly
+    local duration
+    duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$infile" 2>/dev/null)
+    if [[ -z "$duration" || "$duration" == "N/A" ]]; then
+        echo "❌ Could not get video duration"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    # Convert to integer seconds for easier handling
+    local duration_int
+    duration_int=$(printf "%.0f" "$duration")
+
+    echo "📊 Video duration: ${duration}s (${duration_int}s)"
+
+    # Adjust sampling if video is too short
+    if (( duration_int < $((SSIM_SAMPLES * SSIM_SAMPLE_DURATION)) )); then
+        echo "⚠️  Video too short for $SSIM_SAMPLES samples, adjusting..."
+        if (( duration_int < 30 )); then
+            SSIM_SAMPLES=1
+            SSIM_SAMPLE_DURATION=$((duration_int - 5))
+            if (( SSIM_SAMPLE_DURATION < 5 )); then
+                SSIM_SAMPLE_DURATION=5
+            fi
+        else
+            SSIM_SAMPLE_DURATION=$((duration_int / SSIM_SAMPLES))
+        fi
+        echo "   Adjusted to $SSIM_SAMPLES samples of ${SSIM_SAMPLE_DURATION}s each"
+    fi
+
+    # Generate sample timestamps - avoid the very beginning and end
+    local -a sample_times=()
+    local start_offset=15  # Skip first 15 seconds
+    local end_offset=20    # Skip last 20 seconds
+    local usable_duration=$((duration_int - start_offset - end_offset))
+
+    for ((i=0; i<SSIM_SAMPLES; i++)); do
+        local start_time
+        if (( SSIM_SAMPLES == 1 )); then
+            start_time=$((start_offset + usable_duration / 4))  # Start at 25% through
+        else
+            start_time=$((start_offset + (usable_duration * i / (SSIM_SAMPLES - 1))))
+        fi
+        sample_times+=("$start_time")
+    done
+
+    # CRF search bounds - more conservative for libsvtav1
+    local crf_min=21
+    local crf_max=61
+    local tolerance=0.0015  # SSIM tolerance (smaller range since it's 0-1)
+
+    echo "📊 Testing CRF range: $crf_min-$crf_max for SSIM target: $target_ssim"
+    echo "🕐 Sample times: ${sample_times[*]}"
+
+    while (( crf_max - crf_min > 2 )); do
+        local crf_mid=$(( (crf_min + crf_max) / 2 ))
+
+        echo "🧪 Testing CRF: $crf_mid"
+
+        # Test this CRF value with samples
+        local total_ssim=0
+        local valid_samples=0
+
+        for i in "${!sample_times[@]}"; do
+            local start_time="${sample_times[i]}"
+            local sample_encoded="$temp_dir/sample_${i}_crf${crf_mid}.${CONTAINER}"
+            local ssim_log="$temp_dir/ssim_${i}_crf${crf_mid}.log"
+
+            echo "   Encoding sample $((i+1))/$SSIM_SAMPLES (${SSIM_SAMPLE_DURATION}s from ${start_time}s)..."
+
+            # Encode sample with proper libsvtav1 settings
+            local encode_cmd=(
+                ffmpeg -hide_banner -nostdin -loglevel error
+                -ss "$start_time" -t "$SSIM_SAMPLE_DURATION" -i "$infile"
+                -c:v "$VIDEO_CODEC" -crf "$crf_mid" $EXTRA_OPTS
+            )
+
+            # Add preset if specified
+            [[ -n "$PRESET" ]] && encode_cmd+=(-preset "$PRESET")
+
+            # Add libsvtav1 specific options
+            if [[ "$VIDEO_CODEC" == "libsvtav1" ]]; then
+                encode_cmd+=(-svtav1-params "fast-decode=1:tune=0")
+            fi
+
+            # Add pixel format if specified, otherwise use safe default
+            if [[ -n "$PIX" ]]; then
+                encode_cmd+=(-pix_fmt "$PIX")
+            else
+                encode_cmd+=(-pix_fmt yuv420p)
+            fi
+
+            encode_cmd+=(-an -y "$sample_encoded")
+
+            if ! timeout 180 "${encode_cmd[@]}" 2>/dev/null; then
+                echo "   ⚠️  Sample $((i+1)) encoding failed or timed out, skipping"
+                rm -f "$sample_encoded"
+                continue
+            fi
+
+            # Verify the encoded sample exists and has reasonable size
+            if [[ ! -f "$sample_encoded" ]] || [[ $(stat -c%s "$sample_encoded" 2>/dev/null || echo 0) -lt 1024 ]]; then
+                echo "   ⚠️  Sample $((i+1)) encoded file is invalid, skipping"
+                rm -f "$sample_encoded"
+                continue
+            fi
+
+            echo "   Calculating SSIM for sample $((i+1))..."
+
+            # Calculate SSIM - much simpler and more reliable than MS-SSIM
+            local ssim_cmd=(
+                ffmpeg -hide_banner -nostdin -loglevel error
+                -ss "$start_time" -t "$SSIM_SAMPLE_DURATION" -i "$infile"
+                -i "$sample_encoded" $EXTRA_OPTS
+                -filter_complex "[0:v][1:v]ssim=stats_file=$ssim_log"
+                -f null -
+            )
+
+            local sample_ssim=""
+            if timeout 120 "${ssim_cmd[@]}" 2>/dev/null && [[ -f "$ssim_log" ]]; then
+                # Parse SSIM from stats file - extract only the numeric value after 'All:'
+                # Format: n:X Y:X.XXXXX U:X.XXXXX V:X.XXXYYY All:X.XXXYYY(extra_data)
+                sample_ssim=$(awk -F'All:' 'END {
+                    if (NF==2) {
+                        # Extract just the numeric part before any parentheses or spaces
+                        gsub(/\(.*/, "", $2)  # Remove everything from ( onwards
+                        gsub(/[[:space:]].*/, "", $2)  # Remove everything from first space onwards
+                        print $2
+                    }
+                }' "$ssim_log" 2>/dev/null)
+
+                # If that doesn't work, try averaging all frames with the same parsing
+                if [[ -z "$sample_ssim" || "$sample_ssim" == "0" ]]; then
+                    sample_ssim=$(awk -F'All:' '{
+                        if (NF==2) {
+                            # Extract just the numeric part
+                            gsub(/\(.*/, "", $2)
+                            gsub(/[[:space:]].*/, "", $2)
+                            if ($2 > 0) {
+                                sum += $2
+                                count++
+                            }
+                        }
+                    } END {
+                        if (count > 0) printf "%.6f", sum/count
+                    }' "$ssim_log" 2>/dev/null)
+                fi
+            fi
+
+            if [[ -n "$sample_ssim" && "$sample_ssim" != "0" && "$sample_ssim" != "0.000000" ]]; then
+                # Validate SSIM score is reasonable (0-1)
+                if (( $(echo "$sample_ssim >= 0 && $sample_ssim <= 1" | bc -l 2>/dev/null || echo 0) )); then
+                    total_ssim=$(echo "$total_ssim + $sample_ssim" | bc -l)
+                    valid_samples=$((valid_samples + 1))
+                    echo "   Sample $((i+1)): SSIM = $sample_ssim"
+                else
+                    echo "   ⚠️  Sample $((i+1)): Invalid SSIM score: $sample_ssim"
+                fi
+            else
+                echo "   ⚠️  Sample $((i+1)): SSIM calculation failed"
+            fi
+
+            # Cleanup sample files
+            rm -f "$sample_encoded" "$ssim_log"
+        done
+
+        if (( valid_samples == 0 )); then
+            echo "❌ No valid SSIM samples at CRF $crf_mid"
+            if (( crf_mid == (crf_min + crf_max) / 2 )); then
+                echo "❌ Cannot get any SSIM samples, prediction failed"
+                rm -rf "$temp_dir"
+                return 1
+            fi
+            # Try a different CRF value
+            if (( crf_mid < 35 )); then
+                crf_min=$crf_mid
+            else
+                crf_max=$crf_mid
+            fi
+            continue
+        fi
+
+        # Calculate average SSIM
+        local avg_ssim
+        avg_ssim=$(echo "scale=6; $total_ssim / $valid_samples" | bc -l)
+        echo "   Average SSIM: $avg_ssim (from $valid_samples samples)"
+
+        # Check if we're close enough
+        local ssim_diff
+        ssim_diff=$(echo "$avg_ssim - $target_ssim" | bc -l)
+        if (( $(echo "${ssim_diff#-} <= $tolerance" | bc -l) )); then
+            echo "✅ Found suitable CRF: $crf_mid (SSIM: $avg_ssim)"
+            CRF="$crf_mid"
+            rm -rf "$temp_dir"
+            return 0
+        fi
+
+        # Adjust search bounds
+        if (( $(echo "$avg_ssim > $target_ssim" | bc -l) )); then
+            crf_min=$crf_mid
+            echo "   SSIM too high, trying higher CRF"
+        else
+            crf_max=$crf_mid
+            echo "   SSIM too low, trying lower CRF"
+        fi
+    done
+
+    # Use the middle value if we exit the loop
+    CRF=$(( (crf_min + crf_max) / 2 ))
+    echo "🎯 Selected CRF: $CRF (estimated for SSIM: $target_ssim)"
+    rm -rf "$temp_dir"
+    return 0
+}
+
+# Get adjusted duration based on start/end times
+get_adjusted_duration() {
+  local infile="$1"
+  local full_duration
+
+  # Get full duration from file
+  full_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$infile") || {
+    echo "⚠️ ffprobe error" >&2; return 1; }
+
+  # Default duration is full file
+  local adjusted_duration=$full_duration
+
+  # Parse and validate start time
+  local start_seconds=0
+  if [[ -n "$START_TIME" ]]; then
+    # Convert HH:MM:SS format to seconds if needed
+    if [[ "$START_TIME" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+      start_seconds=$(( (10#${BASH_REMATCH[1]} * 3600) + (10#${BASH_REMATCH[2]} * 60) + 10#${BASH_REMATCH[3]} ))
+    elif [[ "$START_TIME" =~ ^([0-9]+):([0-9]+)$ ]]; then
+      start_seconds=$(( (10#${BASH_REMATCH[1]} * 60) + 10#${BASH_REMATCH[2]} ))
+    else
+      start_seconds=$START_TIME
+    fi
+  fi
+
+  # Parse and validate end time
+  local end_seconds=$full_duration
+  if [[ -n "$END_TIME" ]]; then
+    # Convert HH:MM:SS format to seconds if needed
+    if [[ "$END_TIME" =~ ^([0-9]+):([0-9]+):([0-9]+)$ ]]; then
+      end_seconds=$(( (10#${BASH_REMATCH[1]} * 3600) + (10#${BASH_REMATCH[2]} * 60) + 10#${BASH_REMATCH[3]} ))
+    elif [[ "$END_TIME" =~ ^([0-9]+):([0-9]+)$ ]]; then
+      end_seconds=$(( (10#${BASH_REMATCH[1]} * 60) + 10#${BASH_REMATCH[2]} ))
+    else
+      end_seconds=$END_TIME
+    fi
+  fi
+
+  # Calculate adjusted duration
+  adjusted_duration=$(awk -v end="$end_seconds" -v start="$start_seconds" 'BEGIN { print (end - start) }')
+
+  # Ensure duration is positive and within file bounds
+  adjusted_duration=$(awk -v d="$adjusted_duration" -v full="$full_duration" 'BEGIN {
+    if (d <= 0) print 0;
+    else if (d > full) print full;
+    else print d;
+  }')
+
+  echo "$adjusted_duration"
+}
+
+# Compute video bitrate from target size and duration
+parse_bitrate_to_bps() {
+  local input="$1"
+  local value unit
+
+  # Handle formats: 4mbps, 4M, 4m, 320k, 320K, 1000000 (raw bps)
+  if [[ "$input" =~ ^([0-9]+\.?[0-9]*)([kKmMgG]?)(bps)?$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2],,}"  # Convert to lowercase
+
+    case "$unit" in
+      k) echo $(awk "BEGIN {printf \"%.0f\", $value * 1000}") ;;
+      m) echo $(awk "BEGIN {printf \"%.0f\", $value * 1000000}") ;;
+      g) echo $(awk "BEGIN {printf \"%.0f\", $value * 1000000000}") ;;
+      "") echo $(awk "BEGIN {printf \"%.0f\", $value}") ;;  # Raw bps
+      *) echo "0" ;;  # Invalid
+    esac
+  else
+    echo "0"  # Invalid format
+  fi
+}
+
+compute_bitrate_from_size() {
+  local infile="$1"
+  local duration size_bytes target_bits bits_per_s video_bps audio_bps
+
+  # Validate TARGET_SIZE
+  [[ -z "$TARGET_SIZE" ]] && { echo "⚠️ TARGET_SIZE not set" >&2; return 1; }
+  size_bytes=$(size_to_bytes "$TARGET_SIZE")
+  if ! [[ "$size_bytes" =~ ^[0-9]+$ ]] || (( size_bytes <= 0 )); then
+    echo "⚠️ Invalid TARGET_SIZE: $TARGET_SIZE" >&2
+    return 1
+  fi
+
+  # Get duration (seconds, rounded up)
+  local dur_sec
+  dur_sec=$(get_adjusted_duration "$infile") || {
+    echo "⚠️ Error getting duration" >&2; return 1; }
+  duration=$(awk "BEGIN{d=$dur_sec; print (d>0?int(d+0.999):0)}")
+  (( duration <= 0 )) && { echo "⚠️ Invalid duration" >&2; return 1; }
+
+  # Dynamic container overhead
+  local BASE_OVERHEAD=1.00
+  local SLOPE=0.0001
+  local MAX_OVERHEAD=1.4
+  local eff_overhead=$(awk "BEGIN {o = $BASE_OVERHEAD + $SLOPE * $duration; print (o < $MAX_OVERHEAD ? o : $MAX_OVERHEAD)}")
+  echo "📦 Container overhead factor: ${eff_overhead}" >&2
+
+  # Adjust size for overhead and encoder
+  size_bytes=$(awk "BEGIN {adj = $size_bytes / ($eff_overhead * 1); printf \"%.0f\", adj}")
+  (( size_bytes <= 0 )) && { echo "⚠️ Size after overhead invalid" >&2; return 1; }
+  target_bits=$(( size_bytes * 8 ))
+  echo "🎯 Total budget: $((target_bits/1000))k bits over ${duration}s" >&2
+
+  # Bits per second
+  bits_per_s=$(( target_bits / duration ))
+
+  # Maximum bitrate clamps (configurable via environment variables)
+  # Parse human-readable formats: 4mbps, 50M, 320k, etc.
+  local max_video_raw=${MAX_VIDEO_BITRATE:-5M}
+  local max_audio_raw=${MAX_AUDIO_BITRATE:-320k}
+  local max_total_raw=${MAX_TOTAL_BITRATE:-60M}
+
+  # Convert to bits per second
+  local MAX_VIDEO_BITRATE=$(parse_bitrate_to_bps "$max_video_raw")
+  local MAX_AUDIO_BITRATE=$(parse_bitrate_to_bps "$max_audio_raw")
+  local MAX_TOTAL_BITRATE=$(parse_bitrate_to_bps "$max_total_raw")
+
+  # Clamp total bitrate first
+  if (( bits_per_s > MAX_TOTAL_BITRATE )); then
+    echo "🔒 Clamping total bitrate from $((bits_per_s/1000000))Mbps to $((MAX_TOTAL_BITRATE/1000000))Mbps" >&2
+    bits_per_s=$MAX_TOTAL_BITRATE
+  fi
+
+  # Use specified audio bitrate
+  if [[ -n "$AUDIO_BITRATE" ]]; then
+    # Accept formats like 96k or raw bps
+    if [[ "$AUDIO_BITRATE" =~ ^([0-9]+)k$ ]]; then
+      audio_bps=$(( BASH_REMATCH[1] * 1000 ))
+    else
+      audio_bps=$(( $(size_to_bytes "$AUDIO_BITRATE") * 8 ))
+    fi
+
+    # Clamp audio bitrate
+    if (( audio_bps > MAX_AUDIO_BITRATE )); then
+      echo "🔒 Clamping audio bitrate from $((audio_bps/1000))k to $((MAX_AUDIO_BITRATE/1000))k" >&2
+      audio_bps=$MAX_AUDIO_BITRATE
+    fi
+
+    echo "🔊 Using target audio bitrate: $((audio_bps/1000))k" >&2
+  else
+    audio_bps=0
+    echo "🔊 No AUDIO_BITRATE set, allocating all bits to video" >&2
+  fi
+
+  # Allocate remaining bits to video
+  video_bps=$(( bits_per_s - audio_bps ))
+  if (( video_bps < 0 )); then
+    echo "⚠️ Bitrate budget lower than audio, setting video to minimal (0)" >&2
+    video_bps=0
+  fi
+
+  # Clamp video bitrate
+  if (( video_bps > MAX_VIDEO_BITRATE )); then
+    echo "🔒 Clamping video bitrate from $((video_bps/1000000))Mbps to $((MAX_VIDEO_BITRATE/1000000))Mbps" >&2
+    video_bps=$MAX_VIDEO_BITRATE
+  fi
+
+  echo "🎥 Video bitrate: $((video_bps/1000))k" >&2
+  echo "$video_bps"
+}
+
+# Conversion function
+convert_file() {
+  local infile="$1"
+  local base="$(basename "${infile%.*}")"
+  local outdir="${OUTPUT_DIR:-$(dirname "$infile")}"
+  local outfile="$outdir/${base}${SUFFIX}.${CONTAINER}"
+  local passlog="$outdir/${LOG_PREFIX}_${base}"
+
+  # Set current output file for cleanup
+  CURRENT_OUTPUT_FILE="$outfile"
+
+  # Check if we've been interrupted
+  if [[ $INTERRUPTED -eq 1 ]]; then
+    echo "🛑 Skipping $infile due to interruption"
+    return 1
+  fi
+
+  # Predict CRF for target ssim if specified
+  if [[ -n "$target_ssim" && -z "$CRF" ]]; then
+    if ! predict_crf_for_ssim "$infile" "$target_ssim"; then
+      echo "⚠️  CRF prediction failed, falling back to default encoding"
+    fi
+  fi
+
+  # Build time selection flags
+  local time_flags=()
+  if [[ -n "$START_TIME" ]]; then
+    time_flags+=("-ss" "$START_TIME")
+  fi
+  if [[ -n "$END_TIME" ]]; then
+    if [[ -n "$START_TIME" ]]; then
+      # If start time is specified, use -to for duration
+      local duration
+      duration=$(awk -v end="$END_TIME" -v start="$START_TIME" 'BEGIN {
+        if (match(end, /:/)) {
+          # Handle HH:MM:SS format
+          split(end, e, ":")
+          split(start, s, ":")
+          end_sec = (e[1] * 3600) + (e[2] * 60) + e[3]
+          start_sec = (s[1] * 3600) + (s[2] * 60) + s[3]
+          print (end_sec - start_sec)
+        } else {
+          # Handle seconds format
+          print (end - start)
+        }
+      }')
+      time_flags+=("-t" "$duration")
+    else
+      # If no start time, use -to for end time
+      time_flags+=("-to" "$END_TIME")
+    fi
+  fi
+
+if [[ "$VIDEO_CODEC" == "libx265" ]]; then
+    VBV=""
+    [[ -n "$BITRATE" ]] && VBV="bitrate=${BITRATE}"
+    [[ -n "$MAXRATE" ]] && VBV="${VBV:+$VBV:}vbv-maxrate=${MAXRATE}"
+    [[ -n "$BUFSIZE" ]] && VBV="${VBV:+$VBV:}vbv-bufsize=${BUFSIZE}"
+
+    if [[ "$QUALITY" == "1" ]]; then
+        # High quality settings
+        QUALITY_PARAMS="keyint=2400:min-keyint=2400:cutree=1:psy-rd=1.2:psy-rdoq=1.0:aq-mode=3:aq-strength=1.4:sao=1"
+    else
+        # Basic settings
+        QUALITY_PARAMS=""
+    fi
+
+    PASS1="-x265-params pass=1${VBV:+:$VBV}${QUALITY_PARAMS:+:$QUALITY_PARAMS}"
+    PASS2="-x265-params pass=2${VBV:+:$VBV}${QUALITY_PARAMS:+:$QUALITY_PARAMS}"
+    NORM="-x265-params ${QUALITY_PARAMS}"
+elif [[ "$VIDEO_CODEC" == "libsvtav1" ]]; then
+
+    if [[ "$QUALITY" == "1" ]]; then
+        # High quality AV1 tuning parameters
+        QUALITY_PARAMS="-g 2400 -svtav1-params enable-tf=1:aq-mode=2:scd=0:tune=0:keyint=600s:enable-qm=1:enable-variance-boost=1:variance-boost-strength=4"
+    else
+        # Basic settings
+        QUALITY_PARAMS=""
+    fi
+
+    PASS1="-pass 1 $QUALITY_PARAMS"
+    PASS2="-pass 2 $QUALITY_PARAMS"
+    NORM="$QUALITY_PARAMS"
+elif [[ "$VIDEO_CODEC" == "libx264" ]]; then
+
+    if [[ "$QUALITY" == "1" ]]; then
+        # High quality H.264 tuning + OpenCL acceleration
+        QUALITY_PARAMS="-bf 2 -g 9999 -keyint_min 9999 -sc_threshold 0"
+    else
+        # Basic settings with OpenCL for speed
+        QUALITY_PARAMS=""
+    fi
+
+    PASS1="-pass 1 $QUALITY_PARAMS"
+    PASS2="-pass 2 $QUALITY_PARAMS"
+    NORM="${QUALITY_PARAMS}"
+elif [[ "$VIDEO_CODEC" == "hevc_qsv" ]]; then
+
+    if [[ "$QUALITY" == "1" ]]; then
+        # High quality H.264 tuning + OpenCL acceleration
+        QUALITY_PARAMS="-bf 2 -g 9999 -keyint_min 9999 -sc_threshold 0 -extbrc 1 -look_ahead_depth 100"
+    else
+        # Basic settings with OpenCL for speed
+        QUALITY_PARAMS=""
+    fi
+
+    PASS1="pass=1 $QUALITY_PARAMS"
+    PASS2="pass=2 $QUALITY_PARAMS"
+    NORM="${QUALITY_PARAMS}"
+else
+    PASS1="-pass 1"
+    PASS2="-pass 2"
+    NORM=""
+fi
+
+  # Skip if same codec
+  if [[ $FORCE_ENCODE -eq 0 ]]; then
+    local incodec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nw=1:nk=1 "$infile")
+    [[ "$incodec" == "${VIDEO_CODEC%%_*}"* ]] && echo "🔹 Skipping $infile ($incodec)" && return
+  fi
+
+  # Determine bitrate if targeting size
+  if [[ -n "$TARGET_SIZE" ]]; then
+    local video_bps=$(compute_bitrate_from_size "$infile")
+    BITRATE="${video_bps}"
+    echo "🎯 Target size $TARGET_SIZE -> video bitrate $(awk -v b="$video_bps" 'BEGIN { printf "%dk", b / 1024 }')"
+  fi
+
+  # Build video flags
+  local vflags=()
+  [[ -n "$PRESET"          ]] && vflags+=("-preset" "$PRESET")
+  [[ -n "$BITRATE"         ]] && vflags+=("-b:v" "$BITRATE")
+  [[ -n "$MAXRATE"         ]] && vflags+=("-maxrate" "$MAXRATE")
+  [[ -n "$BUFSIZE"         ]] && vflags+=("-bufsize" "$BUFSIZE")
+  [[ -n "$CRF"             ]] && vflags+=("-crf" "$CRF")
+  [[ -n "$QSCALE"          ]] && vflags+=("-qscale:v" "$QSCALE")
+  [[ -n "$GLOBAL_QUALITY"  ]] && vflags+=("-global_quality:v" "$GLOBAL_QUALITY")
+  [[ -n "$VIDEO_CODEC"     ]] && vflags+=("-c:v" "$VIDEO_CODEC")
+  [[ -n "$FPS_LIMIT"       ]] && vflags+=("-r" "$FPS_LIMIT")
+
+  # Improved filter chain management - create a filter chain builder
+  local filter_chain=""
+
+  # Add resolution scaling filter if requested
+  if [[ -n "$TARGET_HEIGHT" ]]; then
+    filter_chain="scale=-2:${TARGET_HEIGHT}:flags=lanczos,pad=ceil(iw/2)*2:ceil(${TARGET_HEIGHT}/2)*2:(ow-iw)/2:(oh-${TARGET_HEIGHT})/2:black"
+  fi
+
+  # Add motion interpolation if requested
+  if [[ -n "$MINTERP" ]]; then
+    local minterp_mode="${MINTERP%%:*}"  # Get part before colon
+    local minterp_fps="${MINTERP##*:}"   # Get part after colon
+
+    # Default to 60fps if not specified
+    [[ "$minterp_fps" == "$minterp_mode" ]] && minterp_fps="60"
+
+    # Set appropriate minterpolate settings based on mode
+    local mi_settings=""
+    case "${minterp_mode,,}" in
+      film)
+        mi_settings="mi_mode=mci:mc_mode=aobmc:me_mode=bidir:me=hexbs:vsbmc=1:mb_size=8:search_param=32:fps=$minterp_fps"
+        ;;
+      anime)
+        mi_settings="mi_mode=mci:mc_mode=aobmc:me_mode=bidir:me=epzs:vsbmc=1:mb_size=16:search_param=24:fps=$minterp_fps"
+        ;;
+      smooth)
+        mi_settings="mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=epzs:vsbmc=1:mb_size=16:search_param=32:fps=$minterp_fps"
+        ;;
+      quick)
+        mi_settings="mi_mode=blend:mc_mode=obmc:me=epzs:vsbmc=1:mb_size=16:search_param=32:fps=$minterp_fps"
+        ;;
+      *)
+        # Custom or default
+        mi_settings="mi_mode=mci:mc_mode=obmc:me_mode=bilat:me=tdls:vsbmc=0:mb_size=16:search_param=4:fps=$minterp_fps"
+        ;;
+    esac
+
+    # Add to filter chain, with comma if needed
+    if [[ -n "$filter_chain" ]]; then
+      filter_chain="${filter_chain},minterpolate=$mi_settings"
+    else
+      filter_chain="minterpolate=$mi_settings"
+    fi
+
+    echo "🎞️ Using motion interpolation: $minterp_mode mode to $minterp_fps fps"
+  fi
+
+  # Apply the complete filter chain if not empty
+  if [[ -n "$filter_chain" ]]; then
+    vflags+=("-vf" "$filter_chain")
+  fi
+
+  # Report time selection if used
+  if [[ -n "$START_TIME" || -n "$END_TIME" ]]; then
+    echo "⏱️ Processing time segment: ${START_TIME:+Start: $START_TIME}${END_TIME:+ to End: $END_TIME}"
+  fi
+
+  echo "🔄 $infile → $outfile"
+
+  local conversion_success=0
+
+  if [[ $USE_TWOPASS -eq 1 ]]; then
+    # First pass
+    nice -n $nice ffmpeg -hide_banner -nostdin -y "${time_flags[@]}" -i "$infile" "${vflags[@]}" ${PIX:+-pix_fmt "$PIX"} $PASS1 -passlogfile "$passlog" -an $EXTRA_OPTS -f null /dev/null &
+    FFMPEG_PID=$!
+
+    if wait $FFMPEG_PID; then
+      FFMPEG_PID=""
+      # Check if interrupted between passes
+      if [[ $INTERRUPTED -eq 1 ]]; then
+        rm -f "${passlog}-0.log" "${passlog}-0.log.mbtree"
+        return 1
+      fi
+
+      # Second pass
+      nice -n $nice ffmpeg -hide_banner -nostdin "${time_flags[@]}" -i "$infile" "${vflags[@]}" ${PIX:+-pix_fmt "$PIX"} $PASS2 -passlogfile "$passlog" $(audio_flags) $EXTRA_OPTS -y "$outfile" &
+      FFMPEG_PID=$!
+
+      if wait $FFMPEG_PID; then
+        conversion_success=1
+      fi
+      FFMPEG_PID=""
+    else
+      FFMPEG_PID=""
+    fi
+
+    rm -f "${passlog}-0.log" "${passlog}-0.log.mbtree"
+  else
+    nice -n $nice ffmpeg -hide_banner -nostdin -loglevel info "${time_flags[@]}" -i "$infile" "${vflags[@]}" ${PIX:+-pix_fmt "$PIX"} $NORM $(audio_flags) $EXTRA_OPTS -y "$outfile" &
+    FFMPEG_PID=$!
+
+    if wait $FFMPEG_PID; then
+      conversion_success=1
+    fi
+    FFMPEG_PID=""
+  fi
+
+  # Validate and handle completion
+  if [[ $conversion_success -eq 1 && -f "$outfile" && $(stat -c%s "$outfile") -gt 1024 && $INTERRUPTED -eq 0 ]]; then
+    echo "✅ $outfile"
+    if (( DELETE_ORIGINAL )); then
+      rm -f "$infile" && echo "🗑 Removed original"
+    fi
+    CURRENT_OUTPUT_FILE=""  # Clear the current output file
+  else
+    if [[ $INTERRUPTED -eq 1 ]]; then
+      echo "🛑 Conversion interrupted for $infile"
+    else
+      echo "❌ Conversion failed for $infile"
+    fi
+    # Clean up failed output file
+    rm -f "$outfile"
+    CURRENT_OUTPUT_FILE=""
+    return 1
+  fi
+}
+
+interpolate() {
+    local infile="$1"
+    local base="$(basename "${infile%.*}")"
+    local outdir="${OUTPUT_DIR:-$(dirname "$infile")}"
+    local outfile="$outdir/${base}interp.${CONTAINER}"
+    local tempdir="/tmp/rife_${$}_$(date +%s)"
+    local inframes="$tempdir/inframes"
+    local outframes="$tempdir/outframes"
+    mkdir -p "$inframes" "$outframes"
+    echo "🎞️ Temp working directory: $tempdir"
+    # Set current output file for cleanup
+    CURRENT_OUTPUT_FILE="$outfile"
+
+    # 1) Probe original FPS
+    local orig_fps target_fps scale_factor
+    orig_fps=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=avg_frame_rate \
+        -of default=noprint_wrappers=1:nokey=1 "$infile")
+    orig_fps=$(awk "BEGIN {split(\"$orig_fps\",f,\"/\"); print f[1]/f[2]}")
+
+    # Interpolation is always 2x
+    target_fps=$(awk "BEGIN {print $orig_fps * 2}")
+    scale_factor=$(awk "BEGIN {printf \"%.6f\", $target_fps / $orig_fps}")
+
+    echo "🎯 Converting: ${orig_fps}fps → ${target_fps}fps (${scale_factor}x interpolation)"
+
+    # 3) Extract frames
+    echo "📦 Extracting frames…"
+    nice -n "${nice:-0}" ffmpeg -hide_banner -nostdin -loglevel info \
+        -i "$infile" -f image2 \
+        "$inframes/frame_%08d.png"
+
+    # Count extracted frames
+    local num_in=$(find "$inframes" -maxdepth 1 -name "frame_*.png" | wc -l)
+    echo "🔍 Extracted $num_in frames"
+    if [ "$num_in" -eq 0 ]; then
+        echo "❌ No frames were extracted!"
+        [ -z "$DEBUG" ] || echo "Leaving temp dir: $tempdir"
+        [ -z "$DEBUG" ] && rm -rf "$tempdir"
+        return 1
+    fi
+
+    threads=$(nproc)
+
+    # 4) Run RIFE interpolation
+    echo "🚀 Running RIFE interpolation…"
+    rife-ncnn-vulkan -m rife-v4.6 -i "$inframes" -o "$outframes" -f "frame_%08d.png" -g 0 -j $threads:$threads:$threads
+
+    # Count RIFE output
+    local num_out=$(find "$outframes" \( -path "$outframes/*.png" -o -path "$outframes/rife_out/*.png" \) | wc -l)
+    echo "🔍 RIFE produced $num_out frames"
+    if [ "$num_out" -eq 0 ]; then
+        echo "❌ RIFE didn't produce any frames!"
+        [ -z "$DEBUG" ] || echo "Leaving temp dir: $tempdir"
+        [ -z "$DEBUG" ] && rm -rf "$tempdir"
+        return 1
+    fi
+
+    # 5) Find the right output directory
+    local png_dir
+    if [ -d "$outframes/rife_out" ] && [ "$(find "$outframes/rife_out" -maxdepth 1 -name '*.png' | wc -l)" -gt 0 ]; then
+        png_dir="$outframes/rife_out"
+    else
+        png_dir="$outframes"
+    fi
+    echo "📁 Using frames from: $png_dir"
+
+    # 6) Encode at target FPS - Fixed command structure
+    echo "🎬 Encoding at ${target_fps}fps…"
+    nice -n "${nice:-0}" ffmpeg -hide_banner -nostdin -loglevel info \
+        -framerate "$target_fps" \
+        -i "$png_dir/frame_%08d.png" \
+        -i "$infile" \
+        -map 0:v -map 1:a? \
+        ${PIX:+-pix_fmt "$PIX"} \
+        -c:v "$VIDEO_CODEC" \
+        $(audio_flags) \
+        $EXTRA_OPTS \
+        -y "$outfile" &
+    FFMPEG_PID=$!
+
+    if wait $FFMPEG_PID; then
+        echo "✅ $outfile"
+        FFMPEG_PID=""
+        CURRENT_OUTPUT_FILE=""
+    else
+        echo "❌ Interpolation failed for $infile"
+        FFMPEG_PID=""
+        rm -f "$outfile"
+        CURRENT_OUTPUT_FILE=""
+        rm -rf "$tempdir"
+        return 1
+    fi
+
+    rm -rf "$tempdir"
+}
+
+# Dispatch
+case "$MODE" in
+  single)
+    [[ -f "$TARGET" ]] || { echo "❗ File not found: $TARGET"; exit 1; }
+    convert_file "$TARGET"
+    ;;
+
+  folder)
+  [[ -d "$TARGET" ]] || { echo "❗ Directory not found: $TARGET"; exit 1; }
+
+  # Build the find expression for your extensions
+  find_expr=()
+  for e in "${EXTENSIONS[@]}"; do
+    find_expr+=( -iname "*.$e" -o )
+  done
+  unset 'find_expr[${#find_expr[@]}-1]'
+
+  # Collect all matching files into an array
+  mapfile -d '' files < <(
+    find "$TARGET" -type f \( "${find_expr[@]}" \) -print0
+  )
+
+  # Filter out files that already have the target suffix
+  filtered_files=()
+  for file in "${files[@]}"; do
+    base="$(basename "${file%.*}")"
+    # Skip if filename already ends with the target suffix
+    if [[ "$base" == *"$SUFFIX" ]]; then
+      echo "🔹 Skipping already processed file: $(basename "$file")"
+      continue
+    fi
+    filtered_files+=("$file")
+  done
+
+  echo "📁 Found ${#filtered_files[@]} files to process (${#files[@]} total, $((${#files[@]} - ${#filtered_files[@]})) already processed)"
+
+  # Process each filtered file
+  for i in "${!filtered_files[@]}"; do
+    infile="${filtered_files[i]}"
+
+    # Check if we've been interrupted
+    if [[ $INTERRUPTED -eq 1 ]]; then
+      echo "🛑 Stopping folder processing due to interruption"
+      break
+    fi
+
+    echo "📊 Processing file $((i+1))/${#filtered_files[@]}: $(basename "$infile")"
+
+    # Run conversion
+    if convert_file "$infile"; then
+      # Success - compute expected output path to verify
+      base="$(basename "${infile%.*}")"
+      outdir="${OUTPUT_DIR:-$(dirname "$infile")}"
+      expected="$outdir/${base}${SUFFIX}.${CONTAINER}"
+
+      if [[ ! -s "$expected" ]]; then
+        echo "⚠ Warning: Expected output not found for: $infile"
+      fi
+    else
+      # Failure or interruption
+      if [[ $INTERRUPTED -eq 1 ]]; then
+        echo "🛑 Stopping due to interruption"
+        break
+      else
+        echo "⚠ Failed to process: $infile"
+      fi
+    fi
+  done
+
+  if [[ $INTERRUPTED -eq 1 ]]; then
+    echo "🛑 Folder processing was interrupted"
+    exit 130
+  else
+    echo "✅ Folder processing completed"
+  fi
+  ;;
+
+  interpolate)
+    [[ -f "$TARGET" ]] || { echo "❗ File not found: $TARGET"; exit 1; }
+    interpolate "$TARGET"
+    ;;
+
+  *)
+    echo "❗ Unknown mode: $MODE"
+    usage
+    ;;
+esac

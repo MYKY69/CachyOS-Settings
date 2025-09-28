@@ -1,0 +1,219 @@
+#!/bin/bash
+set -e
+
+# --- Configuration ---
+PROTON_PATH="/usr/share/steam/compatibilitytools.d/proton-cachyos"
+SCRIPT_NAME="pwine"
+INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
+
+DESKTOP_DIR="$HOME/.local/share/applications"
+
+# --- Check Proton Installation ---
+if [ ! -f "$PROTON_PATH/proton" ] && [ "$1" != "--install" ] && [ "$1" != "--uninstall" ]; then
+    echo "Error: Proton-CachyOS not found at $PROTON_PATH"
+    echo "Please install Proton-CachyOS first."
+    exit 1
+fi
+
+# --- Helper Functions ---
+kill_proton_processes() {
+    echo "Killing all Proton processes..."
+    pkill -f "proton" 2>/dev/null && echo "Killed Proton processes" || echo "No Proton processes found"
+
+    if [ -d "$PREFIX" ]; then
+        ABS_PREFIX=$(realpath "$PREFIX")
+        lsof +D "$ABS_PREFIX" 2>/dev/null | awk 'NR>1 {print $2}' | sort -u | while read pid; do
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null && echo "Killed process $pid using prefix"
+            fi
+        done
+    fi
+}
+
+print_help() {
+    echo "Proton-CachyOS Runner"
+    echo "Usage: $0 [options] [executable]"
+    echo ""
+    echo "Options:"
+    echo "  -p, --prefix      : Set custom prefix path (default: ./proton-prefix)"
+    echo "  -k, --kill        : Kill all Proton processes using the prefix"
+    echo "  --desktop         : Create .desktop shortcut"
+    echo "  --name NAME       : Name for .desktop shortcut (default: executable name)"
+    echo "  --env VAR=VALUE   : Add extra environment variable (repeatable)"
+    echo "  --install         : Install this script to $INSTALL_PATH"
+    echo "  --uninstall       : Uninstall this script from $INSTALL_PATH"
+    echo "  -h, --help        : Show this help"
+    echo ""
+    echo "Environment Variables:"
+    echo "  PROTON_PATH_ENV   : Override Proton installation path"
+    echo ""
+    echo "Examples:"
+    echo "  $0 game.exe"
+    echo "  $0 -p ./game-prefix game.exe"
+    echo "  $0 --kill"
+    echo "  $0 --desktop --name MyGame --env WINEDEBUG=-all game.exe"
+    echo "  sudo $0 --install"
+}
+
+install_script() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Installation requires root privileges. Please run with sudo."
+        exit 1
+    fi
+
+    echo "Installing $SCRIPT_NAME to $INSTALL_PATH"
+    cp "$0" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    echo "Successfully installed. You can now run '$SCRIPT_NAME' from anywhere."
+}
+
+uninstall_script() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Uninstallation requires root privileges. Please run with sudo."
+        exit 1
+    fi
+
+    if [ -f "$INSTALL_PATH" ]; then
+        rm -v "$INSTALL_PATH"
+        echo "Successfully uninstalled."
+    else
+        echo "$SCRIPT_NAME is not installed at $INSTALL_PATH"
+        exit 1
+    fi
+}
+
+create_desktop_shortcut() {
+    local exec_path="$1"
+    local prefix_path="$2"
+    local name="$3"
+    shift 3
+    local extra_env=("$@")
+
+    mkdir -p "$DESKTOP_DIR"
+
+    # Build Exec line with proper --env formatting
+    local env_args=""
+    for e in "${extra_env[@]}"; do
+        env_args+="--env $(printf "%q" "$e") "
+    done
+
+    local exec_command="$SCRIPT_NAME -p \"$(realpath -m "$prefix_path")\" ${env_args}\"$(realpath "$exec_path")\""
+
+    local desktop_file="$DESKTOP_DIR/${name// /_}.desktop"
+
+    cat > "$desktop_file" <<EOF
+[Desktop Entry]
+Name=$name
+Exec=bash -c '$exec_command'
+Type=Application
+Terminal=false
+Icon=application-x-executable
+Categories=Game;
+EOF
+
+    chmod +x "$desktop_file"
+    echo "Shortcut created: $desktop_file"
+    echo "You may need to refresh desktop databases: 'update-desktop-database ~/.local/share/applications'"
+}
+
+# --- Main Script ---
+
+# Handle environment variable override
+if [ -n "$PROTON_PATH_ENV" ]; then
+    PROTON_PATH="$PROTON_PATH_ENV"
+fi
+
+# Handle installation options first
+if [ "$1" = "--install" ]; then
+    install_script
+    exit 0
+elif [ "$1" = "--uninstall" ]; then
+    uninstall_script
+    exit 0
+fi
+
+# Parse other arguments
+PREFIX="./proton-prefix"
+EXECUTABLE=()
+KILL_MODE=false
+DESKTOP_MODE=false
+DESKTOP_NAME=""
+EXTRA_ENV=()
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -p|--prefix)
+            PREFIX="$2"
+            shift 2
+            ;;
+        -k|--kill)
+            KILL_MODE=true
+            shift
+            ;;
+        --desktop)
+            DESKTOP_MODE=true
+            shift
+            ;;
+        --name)
+            DESKTOP_NAME="$2"
+            shift 2
+            ;;
+        --env)
+            EXTRA_ENV+=("$2")
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            EXECUTABLE+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Handle kill mode
+if $KILL_MODE; then
+    kill_proton_processes
+    exit 0
+fi
+
+# Convert prefix to absolute path
+ABS_PREFIX=$(realpath -m "$PREFIX")
+mkdir -p "$ABS_PREFIX"
+
+# Set up environment
+export STEAM_COMPAT_DATA_PATH="$ABS_PREFIX"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.steam/root"
+export SteamAppId="0"
+export SteamGameId="0"
+
+mkdir -p "$STEAM_COMPAT_CLIENT_INSTALL_PATH"
+
+# Desktop shortcut mode
+if $DESKTOP_MODE; then
+    if [ ${#EXECUTABLE[@]} -eq 0 ]; then
+        echo "Error: You must specify an executable when using --desktop"
+        exit 1
+    fi
+
+    # Default name to executable basename if not provided
+    if [ -z "$DESKTOP_NAME" ]; then
+        DESKTOP_NAME="$(basename "${EXECUTABLE[0]}")"
+    fi
+
+    create_desktop_shortcut "${EXECUTABLE[0]}" "$PREFIX" "$DESKTOP_NAME" "${EXTRA_ENV[@]}"
+    exit 0
+fi
+
+echo "Using Proton-CachyOS: $PROTON_PATH"
+echo "Prefix: $ABS_PREFIX"
+
+# Run command or default to winecfg
+if [ ${#EXECUTABLE[@]} -eq 0 ]; then
+    echo "No executable specified. Running winecfg..."
+    exec "$PROTON_PATH/proton" waitforexitandrun winecfg
+else
+    exec "$PROTON_PATH/proton" waitforexitandrun "${EXECUTABLE[@]}"
+fi

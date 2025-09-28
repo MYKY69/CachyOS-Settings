@@ -1,0 +1,472 @@
+#!/bin/bash
+# =============================================================================
+# =============================================================================
+
+SCRIPT_PATH="$(readlink -f "$BASH_SOURCE")"
+LLAMA_DIR="$HOME/mykysw/llama.cpp"
+modelstorage="$HOME/mykysw/modelstorage"
+PROMPTS_DIR="$HOME/mykysw/prompts"
+PHYSICAL_CORES=$(nproc)
+BUILD_THREADS=$PHYSICAL_CORES
+DEFAULT_MODEL_ARGS="--jinja -nkvo -ctk bf16 -ctv bf16 -b 16000 --prio 3 -t $PHYSICAL_CORES $@"
+MODEL_LIST_FILE="$HOME/mykysw/.llm_models"
+PROMPT_LIST_FILE="$HOME/mykysw/.llm_prompts"
+SILLYTAVERN_DIR="$HOME/mykysw/sillytavern"
+SILLYTAVERN_REPO="https://github.com/SillyTavern/SillyTavern.git"
+OOBABOOGA_DIR="$HOME/mykysw/text-generation-webui"
+OOBABOOGA_REPO="https://github.com/oobabooga/text-generation-webui.git"
+BUILDOPT=""
+export BLIS_NUM_THREADS=$PHYSICAL_CORES
+export GOMP_CPU_AFFINITY="0 1 2 3 4 5 6 7 8 9 10 11 12"
+export OMP_NUM_THREADS=$PHYSICAL_CORES
+EDITOR=kate
+CUSTOM_BLAS=
+SUDO=sudo
+USE_OPTIMIZED=true
+
+if [ "$CUSTOM_BLAS" == "OpenBLAS" ]; then
+    export LD_LIBRARY_PATH="$HOME/mykysw/openblas/lib"
+    export OPENBLAS_HOME="$HOME/mykysw/openblas"
+    export BLAS_openblas_LIBRARY="$OPENBLAS_HOME/lib/libopenblas.so"
+    export BLAS_LIBRARIES="$OPENBLAS_HOME/lib/libopenblas.so"
+    export BLAS_INCLUDE_DIRS="$HOME/mykysw/include"
+fi
+
+print_help() {
+    cat <<EOF
+Usage: llm [OPTION]
+
+Options:
+  -i, --install         Clone, build, and install llama.cpp(with cpu backend only) and install this script as "llm".
+  -u, --upgrade         Upgrade llama.cpp and, if installed, upgrade SillyTavern.
+  -e, --edit            Edit this script using $EDITOR.(You may set different editor inside script)
+  -s, --scan            Scan the current directory for .gguf models and add them to the saved list.
+  -d, --delete          Delete a model entry from the saved list.
+  -r, --run-silly       Launch SillyTavern directly without Llamacpp.
+  -o, --run-ooba        Launch text-generation-webui.
+  -h, --help            Display this help message.
+  -Re, --reset           Resets llamacpp build folder, forcing full recompilation(in case of problems)
+  -B, --blis            Installs, Compiles and sets up Blis(after this, enable blas and -DGGML_BLAS_VENDOR=FLAME in config)
+  -c, --compile         Only compiles Llamacpp(use this if you change config)
+  -C, --configure       Runs cmake-gui for configuration(you may enable additional backends here, such as vulkan, hip or cuda)
+  -m, --modellistbedit  Opens llm list and allows you do manually add models or edit their settings.
+  -ps, --scan-prompts   Scan the current directory for .txt prompt files and add them to the saved list.
+  -pd, --delete-prompt  Delete a prompt entry from the saved list.
+  -pe, --edit-prompts   Edit the prompt list file.
+  -is                   Updates or Installs script.
+
+For first run start with -i, which will install this script Llamacpp and let you use it on cpu backend
+For additional backends run llm -C, after you made changes click configure, then exit and run llm -c.
+Sillytavern installs only after you attempt to run it.
+If you wish to update, just run llm -u, which will automaticall update Llama.cpp and Sillytavern retaining your settings.
+You may pass additional arguments after script like so: "llm -ngl 20" for example for offloading 20 layers to secondary backend.
+
+Running without any option:
+  Reads the saved model list from:
+      $MODEL_LIST_FILE
+  and presents a menu of models (with custom settings if defined).
+  Then prompts to choose a mode:
+    1) CLI mode (using llama-cli)
+    2) Server mode (using llama-server)
+    3) SillyTavern mode (launches llama-server with the model and starts SillyTavern)
+EOF
+}
+
+install_llama() {
+    echo "Installing llama.cpp..."
+    if [ ! -d "$LLAMA_DIR" ]; then
+        git clone https://github.com/ggerganov/llama.cpp.git "$LLAMA_DIR"
+    fi
+
+    cd "$LLAMA_DIR" || exit
+    git pull
+
+    cmake -B build "$BUILDOPT"
+    cmake --build build --config Release -j "$BUILD_THREADS"
+    $SUDO cp "$SCRIPT_PATH" /usr/local/bin/llm
+
+    # Create prompts directory
+    mkdir -p "$PROMPTS_DIR"
+
+    echo "Installation complete. Run 'llm' to start using models."
+}
+
+compile_llama() {
+    cd "$LLAMA_DIR" || exit
+    cmake -B build "$BUILDOPT"
+    cmake --build build -j "$BUILD_THREADS"
+    echo "Recompilation complete."
+}
+
+upgrade_llama() {
+    echo "Upgrading llama.cpp..."
+    [ ! -d "$LLAMA_DIR" ] && { echo "llama.cpp not installed!"; exit 1; }
+
+    cd "$LLAMA_DIR" || exit
+    git pull
+    cmake --build build --config Release -j "$BUILD_THREADS"
+    echo "llama.cpp upgraded."
+
+    if [ -d "$SILLYTAVERN_DIR" ]; then
+        echo "Upgrading SillyTavern..."
+        cd "$SILLYTAVERN_DIR" || exit
+        git pull
+        echo "SillyTavern upgraded."
+    fi
+    
+    if [ -d "$OOBABOOGA_DIR" ]; then
+        echo "Upgrading text-generation-webui..."
+        cd "$OOBABOOGA_DIR" || exit
+        git pull
+        echo "text-generation-webui upgraded."
+    fi
+}
+
+configure() {
+
+    ccmake $LLAMA_DIR/build
+}
+
+reset_build() {
+    echo "Reset in progress"
+    cd "$LLAMA_DIR"
+    rm -fr build
+    echo "Reset complete, dont forget to run -i to install modified build, -u wont work."
+}
+
+edit_script() {
+    $EDITOR "$(readlink -f "$0")"
+}
+
+blis() {
+    cd /tmp
+    git clone https://github.com/flame/blis
+    cd blis
+    ./configure --enable-cblas -t openmp zen
+    # will install to /usr/local/ by default.
+    make -j
+    $SUDO make install
+}
+
+Openblas() {
+    cd /tmp
+    git clone https://github.com/OpenMathLib/OpenBLAS.git
+    cd OpenBLAS
+    make USE_OPENMP=1 BINARY=64 NO_CBLAS=0 NO_LAPACK=1 NO_LAPACKE=1 DYNAMIC_ARCH=0 NO_STATIC=0 INTERFACE64=1 COMMON_OPT="-flto -O3 -march=native" NUM_THREADS=$OMP_NUM_THREADS -j$BUILD_THREADS
+    make PREFIX="$HOME/mykysw/openblas" install
+}
+
+scan_models() {
+    echo "Scanning $PWD for .gguf models..."
+    shopt -s nullglob
+    local found=0
+
+    # Create models storage directory if it doesn't exist
+    mkdir -p "$modelstorage"
+
+    for file in *.gguf; do
+        found=1
+        echo -e "
+Found new model: $file"
+        read -rp "Add this model? [Y/n] " add_choice
+        add_choice="${add_choice:-Y}"
+        if [[ "$add_choice" =~ ^[Yy]$ ]]; then
+            default_alias="${file%.*}"
+            read -rp "Enter alias [$default_alias]: " alias
+            alias="${alias:-$default_alias}"
+            read -rp "Custom args (leave blank for default): " custom_args
+
+            # Move the model to the storage directory
+            mv "$file" "$modelstorage/"
+            model_path="$modelstorage/$file"
+
+            echo "${alias}|${model_path}|${custom_args}" >> "$MODEL_LIST_FILE"
+            echo "Added and moved: $alias to $modelstorage"
+        else
+            echo "Skipping $file"
+        fi
+    done
+    [ "$found" -eq 0 ] && echo "No new models found."
+}
+
+scan_prompts() {
+    echo "Scanning $PWD for .txt prompt files..."
+    shopt -s nullglob
+    local found=0
+
+    # Create prompts directory if it doesn't exist
+    mkdir -p "$PROMPTS_DIR"
+
+    for file in *.txt; do
+        found=1
+        echo -e "
+Found prompt file: $file"
+        read -rp "Add this prompt? [Y/n] " add_choice
+        add_choice="${add_choice:-Y}"
+        if [[ "$add_choice" =~ ^[Yy]$ ]]; then
+            default_alias="${file%.*}"
+            read -rp "Enter prompt alias [$default_alias]: " alias
+            alias="${alias:-$default_alias}"
+            read -rp "Description (optional): " description
+
+            # Move the prompt to the storage directory
+            cp "$file" "$PROMPTS_DIR/"
+            prompt_path="$PROMPTS_DIR/$file"
+
+            echo "${alias}|${prompt_path}|${description}" >> "$PROMPT_LIST_FILE"
+            echo "Added prompt: $alias to $PROMPTS_DIR"
+        else
+            echo "Skipping $file"
+        fi
+    done
+    [ "$found" -eq 0 ] && echo "No prompt files found."
+}
+
+delete_model() {
+    [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models saved!"; exit 1; }
+
+    echo "Saved models:"
+    mapfile -t models < "$MODEL_LIST_FILE"
+    for i in "${!models[@]}"; do
+        IFS='|' read -r alias path _ <<< "${models[$i]}"
+        printf "%2d) %-20s %s
+" "$((i+1))" "$alias" "$path"
+    done
+
+    read -rp "Enter number to delete: " num
+    index=$((num-1))
+    [ -z "${models[$index]}" ] && { echo "Invalid number!"; exit 1; }
+
+    tmpfile=$(mktemp)
+    for i in "${!models[@]}"; do
+        [ "$i" -ne "$index" ] && echo "${models[$i]}" >> "$tmpfile"
+    done
+    mv "$tmpfile" "$MODEL_LIST_FILE"
+    echo "Model deleted."
+}
+
+delete_prompt() {
+    [ ! -f "$PROMPT_LIST_FILE" ] && { echo "No prompts saved!"; exit 1; }
+
+    echo "Saved prompts:"
+    mapfile -t prompts < "$PROMPT_LIST_FILE"
+    for i in "${!prompts[@]}"; do
+        IFS='|' read -r alias path description <<< "${prompts[$i]}"
+        printf "%2d) %-20s %s
+" "$((i+1))" "$alias" "${description:-$path}"
+    done
+
+    read -rp "Enter number to delete: " num
+    index=$((num-1))
+    [ -z "${prompts[$index]}" ] && { echo "Invalid number!"; exit 1; }
+
+    tmpfile=$(mktemp)
+    for i in "${!prompts[@]}"; do
+        [ "$i" -ne "$index" ] && echo "${prompts[$i]}" >> "$tmpfile"
+    done
+    mv "$tmpfile" "$PROMPT_LIST_FILE"
+    echo "Prompt deleted."
+}
+
+select_prompt() {
+    [ ! -f "$PROMPT_LIST_FILE" ] && { echo "No prompts saved. Use -ps to scan for prompts."; return 1; }
+
+    echo -e "
+Available prompts:"
+    echo "0) No system prompt"
+    mapfile -t prompts < "$PROMPT_LIST_FILE"
+    for i in "${!prompts[@]}"; do
+        IFS='|' read -r alias path description <<< "${prompts[$i]}"
+        printf "%2d) %-20s %s
+" "$((i+1))" "$alias" "${description:-$path}"
+    done
+
+    read -rp "Select prompt (0 for none): " prompt_num
+
+    if [ "$prompt_num" = "" ]; then
+        prompt_num=0
+    fi
+
+    if [ "$prompt_num" = "0" ]; then
+        selected_prompt=""
+        return 0
+    fi
+
+    prompt_index=$((prompt_num-1))
+    [ -z "${prompts[$prompt_index]}" ] && { echo "Invalid selection!"; return 1; }
+
+    IFS='|' read -r _ selected_prompt _ <<< "${prompts[$prompt_index]}"
+    echo "Selected prompt: $(basename "$selected_prompt")"
+}
+
+install_script() {
+    $SUDO cp "$SCRIPT_PATH" /usr/local/bin/llm
+    echo script updated/installed!
+}
+
+launch_sillytavern() {
+    echo -e "
+Starting llama-server with model..."
+    "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args &
+    llama_pid=$!
+    echo "llama-server PID: $llama_pid"
+
+    echo -e "
+Launching SillyTavern..."
+    (cd "$SILLYTAVERN_DIR" && ./start.sh)
+}
+
+editllmdb() {
+    $EDITOR $MODEL_LIST_FILE
+}
+
+edit_prompts() {
+    $EDITOR $PROMPT_LIST_FILE
+}
+
+run_sillytavern() {
+    [ ! -d "$SILLYTAVERN_DIR" ] && {
+        echo "Installing SillyTavern..."
+        git clone "$SILLYTAVERN_REPO" "$SILLYTAVERN_DIR"
+    }
+
+    (cd "$SILLYTAVERN_DIR" && ./start.sh)
+}
+
+install_oobabooga() {
+    [ ! -d "$OOBABOOGA_DIR" ] && {
+        echo "Installing text-generation-webui..."
+        git clone "$OOBABOOGA_REPO" "$OOBABOOGA_DIR"
+    }
+}
+
+run_oobabooga() {
+    install_oobabooga
+
+    if [ "$USE_OPTIMIZED" = true ]; then
+        echo "Optimized llama.cpp backend enabled."
+        OOBABOOGA_LLAMA_BIN_DIR="/home/myky/mykysw/text-generation-webui/installer_files/env/lib/python3.11/site-packages/llama_cpp_binaries/bin"
+        OPTIMIZED_LLAMA_BIN_DIR="$HOME/mykysw/llama.cpp/build/bin"
+
+        if [ -d "$OOBABOOGA_LLAMA_BIN_DIR" ] && [ -d "$OPTIMIZED_LLAMA_BIN_DIR" ]; then
+            echo "Found llama.cpp binaries directories."
+            echo "Symlinking optimized binaries..."
+            for f in "$OPTIMIZED_LLAMA_BIN_DIR"/*; do
+                ln -sf "$f" "$OOBABOOGA_LLAMA_BIN_DIR/"
+            done
+            echo "Symlinking complete."
+        else
+            echo "Warning: Could not find the llama.cpp binaries directories in text-generation-webui or the optimized build."
+        fi
+    fi
+
+    # Link the model storage to the oobabooga models directory
+    ln -sfn "$modelstorage" "$OOBABOOGA_DIR/models"
+
+    (cd "$OOBABOOGA_DIR" && ./start_linux.sh --model-dir "$modelstorage")
+}
+
+launch_crush() {
+    if [ ! -f "$HOME/.local/share/crush/crush.json" ]; then
+        echo "Setting up Crush..."
+        cat > "$HOME/.local/share/crush/crush.json" <<'EOF'
+{
+  "$schema": "https://charm.land/crush.json",
+  "providers": {
+    "llamacpp": {
+      "type": "openai",
+      "base_url": "http://localhost:8080/v1",
+      "api_key": "dummy",
+      "models": [
+        {
+          "id": "llama",
+          "name": "Llama via llama.cpp",
+          "cost_per_1m_in": 0,
+          "cost_per_1m_out": 0,
+          "context_window": 8048,
+          "default_max_tokens": 1000
+        }
+      ]
+    }
+  }
+}
+EOF
+    fi
+
+    echo -e "
+Starting llama-server with model..."
+    "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args > llama-server.log 2>&1 &
+    llama_pid=$!
+    echo "llama-server PID: $llama_pid"
+
+    echo -e "
+Launching Crush..."
+    crush
+    kill $llama_pid
+}
+
+run_model() {
+    [ ! -f "$MODEL_LIST_FILE" ] && { echo "No models saved!"; exit 1; }
+
+    echo "Available models:"
+    mapfile -t models < "$MODEL_LIST_FILE"
+    for i in "${!models[@]}"; do
+        IFS='|' read -r alias path custom <<< "${models[$i]}"
+        printf "%2d) %-20s %s
+" "$((i+1))" "$alias" "${custom:-default settings}"
+    done
+
+    read -rp "Select model: " num
+    index=$((num-1))
+    [ -z "${models[$index]}" ] && { echo "Invalid selection!"; exit 1; }
+
+    IFS='|' read -r selected_alias selected_path selected_custom <<< "${models[$index]}"
+    final_args="${selected_custom:-$DEFAULT_MODEL_ARGS}"
+
+    echo -e "
+Choose mode:"
+    echo "1) CLI Mode"
+    echo "2) Private Server Mode"
+    echo "3) Public server Mode"
+    echo "4) Private Server + SillyTavern Mode"
+    echo "5) Private Server + Crush Mode"
+    read -rp "Enter choice: " mode
+
+    case $mode in
+        1)  select_prompt
+            llama_flags="--no-display-prompt"
+            if [ -n "$selected_prompt" ]; then
+                "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" --system-prompt-file "$selected_prompt" $llama_flags $final_args
+            else
+                "$LLAMA_DIR/build/bin/llama-cli" -m "$selected_path" $llama_flags $final_args
+            fi
+            ;;
+        2) "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args ;;
+        3) "$LLAMA_DIR/build/bin/llama-server" -m "$selected_path" $final_args --host 0.0.0.0 ;;
+        4) launch_sillytavern ;;
+        5) launch_crush ;;
+        *) echo "Invalid choice!"; exit 1 ;;
+    esac
+}
+
+case "$1" in
+    -is|--installscr)    install_script ;;
+    -i|--install)        install_llama ;;
+    -u|--upgrade)        upgrade_llama ;;
+    -e|--edit)           edit_script ;;
+    -s|--scan)           scan_models ;;
+    -d|--delete)         delete_model ;;
+    -r|--run-silly)      run_sillytavern ;;
+    -o|--run-ooba)       run_oobabooga ;;
+    -B|--blis)           blis ;;
+    -Re|--reset)         reset_build ;;
+    -h|--help)           print_help ;;
+    -C|--configure)      configure ;;
+    -m|--modellistbedit) editllmdb ;;
+    -ps|--scan-prompts)  scan_prompts ;;
+    -pd|--delete-prompt) delete_prompt ;;
+    -pe|--edit-prompts)  edit_prompts ;;
+    -opb|--OpenBLAS)     Openblas ;;
+    -c|--compile)        compile_llama ;;
+    *)                   run_model ;;
+esac
